@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mailbot"
+version = "0.1.0"
+description = "Модуль качественных почтовых рассылок: Яндекс Почта и доменная почта, планирование, отписки, баунсы."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "pydantic-settings>=2.2",
+    "jinja2>=3.1",
+    "email-validator>=2.1",
+    "dnspython>=2.6",
+    "cryptography>=42",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "aiosmtpd>=1.4.6",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=3.8",
+]
+
+[project.scripts]
+mailbot = "mailbot.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mailbot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["mailbot"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["src/mailbot/migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "SIM",      # simplify
+    "C4",       # comprehensions
+    "RUF",      # ruff-specific
+    "S",        # bandit (security)
+    "PTH",      # pathlib
+    "T20",      # no print() in library code
+]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # кириллица в строках/комментариях — это нормально
+    "S101",                        # assert используется для сужения типов (mypy), а не для валидации
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108", "T20"]
+"examples/**" = ["T20", "S105", "S106"]
+"src/mailbot/cli.py" = ["T20"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = []
+mypy_path = "src"
+files = ["src", "tests", "examples"]
+exclude = ["src/mailbot/migrations/versions/"]
+
+[[tool.mypy.overrides]]
+module = ["aiosmtpd.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_decorators = false

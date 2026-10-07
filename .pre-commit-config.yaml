@@ -1,0 +1,26 @@
+# Установка: make install  (ставит и git-хук). Ручной запуск: pre-commit run --all-files
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: detect-private-key   # страховка: ключи/сертификаты не должны попасть в git
+  - repo: local
+    hooks:
+      # Берём ruff из dev-окружения проекта, чтобы версия была одна — из pyproject.toml.
+      - id: ruff
+        name: ruff check
+        entry: ruff check --fix
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format
+        language: system
+        types: [python]
