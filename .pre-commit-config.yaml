@@ -16,11 +16,11 @@ repos:
       # Берём ruff из dev-окружения проекта, чтобы версия была одна — из pyproject.toml.
       - id: ruff
         name: ruff check
-        entry: ruff check --fix
+        entry: ruff check --fix --force-exclude
         language: system
         types: [python]
       - id: ruff-format
         name: ruff format
-        entry: ruff format
+        entry: ruff format --force-exclude
         language: system
         types: [python]
