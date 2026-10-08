@@ -246,7 +246,9 @@ class Delivery(Base):
     smtp_code: Mapped[int | None]
     message_id: Mapped[str | None] = mapped_column(String(998))
     sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
-    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow, onupdate=utcnow)
+    # No onupdate: every writer sets this from its injected clock, so the stale-"sending" recovery
+    # compares timestamps from one source only.
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
     __table_args__ = (
         UniqueConstraint("campaign_id", "contact_id", name="uq_deliveries_campaign_contact"),

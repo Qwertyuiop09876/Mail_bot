@@ -177,6 +177,7 @@ class Dispatcher:
                         "interrupted while sending; delivery state unknown, not retried "
                         "automatically to avoid duplicates"
                     ),
+                    updated_at=now,
                 )
             )
             count = int(result.rowcount or 0)  # type: ignore[attr-defined]

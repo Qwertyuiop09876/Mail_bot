@@ -104,7 +104,7 @@ class Env:
                 return
 
 
-def _make_env(**overrides: Any) -> Env:
+def _make_env(start: datetime = START, **overrides: Any) -> Env:
     params: dict[str, Any] = {
         "database_url": "sqlite:///:memory:",
         "secret_key": generate_key(),
@@ -116,7 +116,7 @@ def _make_env(**overrides: Any) -> Env:
     }
     settings = Settings(_env_file=None, **params)  # type: ignore[call-arg]
     transport = FakeTransport()
-    clock = FakeClock()
+    clock = FakeClock(start)
     sleeps: list[float] = []
 
     def factory(_cfg: SmtpConfig) -> FakeTransport:

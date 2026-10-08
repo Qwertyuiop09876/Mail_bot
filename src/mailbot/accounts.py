@@ -17,6 +17,10 @@ from .providers import get_preset
 from .smtp import SmtpConfig, SmtpTransport, Transport
 
 
+def _is_loopback(host: str) -> bool:
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
 @dataclass(frozen=True)
 class ConnectionCheck:
     ok: bool
@@ -71,6 +75,11 @@ class AccountService:
         if not host:
             raise ValidationError("smtp_host is required for a custom provider")
         security = Security(smtp_security) if smtp_security else preset.smtp_security
+        if security is Security.NONE and not _is_loopback(host):
+            raise ValidationError(
+                "Unencrypted SMTP (smtp_security='none') would send the password in clear text; "
+                "it is only allowed for localhost. Use 'ssl' or 'starttls'."
+            )
         limit = daily_limit if daily_limit is not None else preset.daily_limit
         rate = rate_per_minute if rate_per_minute is not None else preset.rate_per_minute
         if limit < 1 or rate < 1:

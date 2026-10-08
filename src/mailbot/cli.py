@@ -8,6 +8,7 @@ process or be checked from a shell.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 from wsgiref.simple_server import WSGIRequestHandler, make_server
@@ -50,6 +51,126 @@ def init_db() -> None:
     with _bot() as bot:
         bot.init_db()
         click.echo(f"База готова: {bot.settings.database_url}")
+
+
+_YANDEX_LOGIN_HINT = (
+    "Частые причины для Яндекса: используется пароль аккаунта вместо пароля приложения; "
+    "в Почта → Настройки → Почтовые программы не включён доступ по IMAP; "
+    "логин указан без домена (нужен полный адрес)."
+)
+
+
+@cli.command("account-add")
+@click.argument("name")
+@click.option(
+    "--provider",
+    type=click.Choice(["yandex", "yandex360", "custom"]),
+    required=True,
+    help="yandex — обычный ящик @yandex.ru; yandex360 — ящик на своём домене в Яндекс 360; "
+    "custom — любой другой SMTP.",
+)
+@click.option("--email", "from_email", required=True, help="Адрес отправителя.")
+@click.option("--from-name", help="Имя отправителя, как увидит получатель.")
+@click.option("--reply-to", help="Куда приходят ответы, если не на адрес отправителя.")
+@click.option("--login", "username", help="Логин SMTP, если он отличается от адреса.")
+@click.option("--smtp-host", help="Для custom обязателен.")
+@click.option("--smtp-port", type=int)
+@click.option("--smtp-security", type=click.Choice(["ssl", "starttls", "none"]))
+@click.option("--imap-host", help="Нужен для чтения отчётов о недоставке (scan-bounces).")
+@click.option("--imap-port", type=int)
+@click.option("--daily-limit", type=int, help="Писем в сутки (по умолчанию — из пресета).")
+@click.option("--rate-per-minute", type=int, help="Писем в минуту (по умолчанию — из пресета).")
+@click.option(
+    "--password-env",
+    metavar="VAR",
+    help="Взять пароль из переменной окружения VAR вместо запроса. Пароль не принимается "
+    "аргументом: он остался бы в истории shell и в списке процессов.",
+)
+@click.option("--no-check", is_flag=True, help="Сохранить без проверки входа в SMTP.")
+def account_add(
+    name: str,
+    provider: str,
+    from_email: str,
+    from_name: str | None,
+    reply_to: str | None,
+    username: str | None,
+    smtp_host: str | None,
+    smtp_port: int | None,
+    smtp_security: str | None,
+    imap_host: str | None,
+    imap_port: int | None,
+    daily_limit: int | None,
+    rate_per_minute: int | None,
+    password_env: str | None,
+    no_check: bool,
+) -> None:
+    """Добавить ящик-отправитель. Пароль спросят скрытым вводом.
+
+    Ящик сохраняется, только если вход в SMTP удался (или указан --no-check).
+    Пароль хранится в базе в зашифрованном виде; сама база и .env в git не попадают.
+    """
+    if password_env:
+        password = os.environ.get(password_env, "")
+        if not password:
+            raise click.UsageError(f"Переменная окружения {password_env} не задана или пуста")
+    else:
+        password = click.prompt(
+            "Пароль (для Яндекса — пароль приложения), ввод скрыт", hide_input=True
+        )
+
+    with _bot() as bot:
+        bot.init_db()
+        account = bot.accounts.add(
+            name,
+            provider=provider,
+            from_email=from_email,
+            password=password,
+            from_name=from_name,
+            reply_to=reply_to,
+            username=username,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_security=smtp_security,
+            imap_host=imap_host,
+            imap_port=imap_port,
+            daily_limit=daily_limit,
+            rate_per_minute=rate_per_minute,
+        )
+        if not no_check:
+            result = bot.accounts.check_connection(name)
+            for warning in result.warnings:
+                click.secho(f"! {warning}", fg="yellow")
+            if not result.ok:
+                bot.accounts.delete(name)  # nothing uses it yet; don't keep a broken account
+                click.secho(
+                    f"Вход не удался, ящик не сохранён: {result.detail}", fg="red", err=True
+                )
+                if provider.startswith("yandex"):
+                    click.echo(_YANDEX_LOGIN_HINT, err=True)
+                raise SystemExit(1)
+            click.secho(result.detail, fg="green")
+        click.echo(
+            f"Ящик «{account.name}» ({account.from_email}) сохранён. "
+            f"Лимиты: {account.daily_limit} писем/сутки, {account.rate_per_minute}/мин."
+        )
+
+
+@cli.command()
+def accounts() -> None:
+    """Показать добавленные ящики (пароли не показываются)."""
+    with _bot() as bot:
+        rows = bot.accounts.all()
+        if not rows:
+            click.echo(
+                "Ящиков нет. Добавьте: mailbot account-add NAME --provider yandex --email ..."
+            )
+            return
+        for a in rows:
+            click.echo(
+                f"{a.name} [{a.provider}] {a.from_email} · "
+                f"{a.smtp_host}:{a.smtp_port}/{a.smtp_security.value} · "
+                f"{a.daily_limit}/сутки, {a.rate_per_minute}/мин"
+            )
 
 
 @cli.command()

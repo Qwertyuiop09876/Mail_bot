@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from datetime import timedelta
 from pathlib import Path
 
 from mailbot.models import CampaignStatus
@@ -27,7 +28,10 @@ def test_quickstart_flow_runs_end_to_end(env: Env, tmp_path: Path) -> None:
     assert env.bot.campaigns.get(campaign_id).status is CampaignStatus.SCHEDULED
     assert [m["Subject"].startswith("[TEST]") for _, m in env.transport.sent] == [True]
 
-    env.clock.advance(days=1, minutes=1)
+    # The example schedules "tomorrow" by the real clock; move the fake clock just past that.
+    scheduled_at = env.bot.campaigns.get(campaign_id).scheduled_at
+    assert scheduled_at is not None
+    env.clock.now = scheduled_at + timedelta(minutes=1)
     env.run_to_completion()
     subjects = {r: m["Subject"] for r, m in env.transport.sent if r != "me@example.com"}
     assert subjects == {

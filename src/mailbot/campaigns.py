@@ -12,7 +12,7 @@ State machine::
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -81,10 +81,17 @@ def recipient_ids_stmt(list_ids: Sequence[int]) -> Any:
 
 
 class CampaignService:
-    def __init__(self, db: Database, settings: Settings, signer: UnsubscribeSigner | None) -> None:
+    def __init__(
+        self,
+        db: Database,
+        settings: Settings,
+        signer: UnsubscribeSigner | None,
+        clock: Callable[[], datetime] = utcnow,
+    ) -> None:
         self._db = db
         self._settings = settings
         self._signer = signer
+        self._clock = clock
 
     # ---- creation --------------------------------------------------------------------------
 
@@ -275,7 +282,7 @@ class CampaignService:
     def schedule(self, campaign_id: int, at: datetime | None = None) -> Campaign:
         """Queue the campaign for ``at`` (naive values are read in MAILBOT_TIMEZONE; ``None`` means
         as soon as the worker picks it up). Raises ValidationError if validation fails."""
-        when = self._to_utc(at) if at is not None else utcnow()
+        when = self._to_utc(at) if at is not None else self._clock()
         report = self.validate(campaign_id)
         if not report.ok:
             raise ValidationError("Campaign is not ready: " + " | ".join(report.errors))
@@ -344,10 +351,14 @@ class CampaignService:
                     Delivery.campaign_id == campaign.id,
                     Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.SENDING]),
                 )
-                .values(status=DeliveryStatus.SKIPPED, last_error="campaign cancelled")
+                .values(
+                    status=DeliveryStatus.SKIPPED,
+                    last_error="campaign cancelled",
+                    updated_at=self._clock(),
+                )
             )
             campaign.status = CampaignStatus.CANCELLED
-            campaign.finished_at = utcnow()
+            campaign.finished_at = self._clock()
             return campaign
 
     def retry_failed(self, campaign_id: int) -> int:
@@ -373,8 +384,9 @@ class CampaignService:
                 .values(
                     status=DeliveryStatus.PENDING,
                     attempts=0,
-                    next_attempt_at=utcnow(),
+                    next_attempt_at=self._clock(),
                     last_error=None,
+                    updated_at=self._clock(),
                 )
             )
             count = int(result.rowcount or 0)  # type: ignore[attr-defined]

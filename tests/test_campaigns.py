@@ -128,5 +128,10 @@ def test_provider_presets(env: Env) -> None:
     )
     with pytest.raises(ValidationError, match="smtp_host"):
         env.bot.accounts.add("x", provider="custom", from_email="a@b.ru", password="p")
+    with pytest.raises(ValidationError, match="clear text"):
+        env.bot.accounts.add(
+            "plain", provider="custom", smtp_host="smtp.example.com", smtp_security="none",
+            from_email="a@b.ru", password="p",
+        )  # fmt: skip
     with pytest.raises(ValidationError, match="Unknown provider"):
         env.bot.accounts.add("y", provider="gmail", from_email="a@b.ru", password="p")

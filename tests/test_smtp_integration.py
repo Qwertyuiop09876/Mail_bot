@@ -207,3 +207,96 @@ def test_check_connection_reports_success_and_failure(server, tmp_path) -> None:
         assert ya.provider == "yandex"
         warnings = bot.accounts.check_connection("ya").warnings
         assert warnings and "match the login" in warnings[0]
+
+
+# ---- `mailbot account-add` through a real SMTP server ------------------------------------------
+
+
+@pytest.fixture
+def cli_env(monkeypatch, tmp_path):  # type: ignore[no-untyped-def]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MAILBOT_SECRET_KEY", generate_key())
+    monkeypatch.setenv("MAILBOT_DATABASE_URL", f"sqlite:///{tmp_path}/cli.db")
+
+
+def add_args(port: int, *extra: str) -> list[str]:
+    return [
+        "account-add", "main", "--provider", "custom", "--email", "news@example.com",
+        "--smtp-host", "127.0.0.1", "--smtp-port", str(port), "--smtp-security", "none",
+        "--from-name", "Магазин", *extra,
+    ]  # fmt: skip
+
+
+def test_account_add_saves_a_working_mailbox_and_hides_the_password(server, cli_env) -> None:  # type: ignore[no-untyped-def]
+    from click.testing import CliRunner
+
+    from mailbot.cli import cli
+
+    _, port = server
+    runner = CliRunner()
+    result = runner.invoke(cli, add_args(port), input="app-pass\n")
+    assert result.exit_code == 0, result.output
+    assert "app-pass" not in result.output  # the prompt is hidden and nothing echoes it back
+    assert "сохранён" in result.output
+
+    listing = runner.invoke(cli, ["accounts"])
+    assert "main [custom] news@example.com" in listing.output and "app-pass" not in listing.output
+
+    # The stored copy is encrypted, not the plaintext.
+    import sqlite3
+    from pathlib import Path
+
+    db_path = Path.cwd() / "cli.db"
+    (stored,) = sqlite3.connect(db_path).execute("select password_enc from accounts").fetchone()
+    assert "app-pass" not in stored
+
+
+def test_account_add_rolls_back_when_login_fails(server, cli_env) -> None:  # type: ignore[no-untyped-def]
+    from click.testing import CliRunner
+
+    from mailbot.cli import cli
+
+    _, port = server
+    runner = CliRunner()
+    result = runner.invoke(cli, add_args(port), input="wrong-password\n")
+    assert result.exit_code == 1
+    assert "ящик не сохранён" in result.output and "wrong-password" not in result.output
+    assert "Ящиков нет" in runner.invoke(cli, ["accounts"]).output
+
+
+def test_account_add_reads_the_password_from_the_environment(server, cli_env, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from click.testing import CliRunner
+
+    from mailbot.cli import cli
+
+    _, port = server
+    runner = CliRunner()
+    monkeypatch.setenv("YA_PASS", "app-pass")
+    assert runner.invoke(cli, add_args(port, "--password-env", "YA_PASS")).exit_code == 0
+
+    runner = CliRunner()
+    missing = runner.invoke(cli, add_args(port, "--password-env", "NOT_SET_ANYWHERE"))
+    assert missing.exit_code != 0 and "NOT_SET_ANYWHERE" in missing.output
+
+
+def test_account_add_no_check_works_offline_and_yandex_gets_its_preset(cli_env) -> None:  # type: ignore[no-untyped-def]
+    from click.testing import CliRunner
+
+    from mailbot.cli import cli
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "account-add",
+            "ya",
+            "--provider",
+            "yandex360",
+            "--email",
+            "team@example.com",
+            "--no-check",
+        ],
+        input="pw\n",
+    )
+    assert result.exit_code == 0 and "3000 писем/сутки" in result.output
+    assert "smtp.yandex.ru:465/ssl" in runner.invoke(cli, ["accounts"]).output

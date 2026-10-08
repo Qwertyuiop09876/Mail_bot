@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import csv
 import io
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -76,8 +77,9 @@ def _clean(value: str | None) -> str | None:
 
 
 class ContactService:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, clock: Callable[[], datetime] = utcnow) -> None:
         self._db = db
+        self._clock = clock
 
     # ---- lists -----------------------------------------------------------------------------
 
@@ -215,7 +217,7 @@ class ContactService:
             contact = self._contact(s, email)
             contact.status = ContactStatus.ACTIVE
             contact.status_reason = f"resubscribed: {reason}"
-            contact.status_changed_at = utcnow()
+            contact.status_changed_at = self._clock()
             contact.status_campaign_id = None
 
     # ---- import / export -------------------------------------------------------------------
@@ -377,7 +379,7 @@ class ContactService:
         )
         new = [cid for cid in dict.fromkeys(contact_ids) if cid not in existing]
         if new:
-            now = utcnow()
+            now = self._clock()
             s.execute(
                 list_members.insert(),
                 [{"list_id": list_id, "contact_id": cid, "added_at": now} for cid in new],
@@ -393,7 +395,7 @@ class ContactService:
                 return False
             contact.status = status
             contact.status_reason = reason
-            contact.status_changed_at = utcnow()
+            contact.status_changed_at = self._clock()
             contact.status_campaign_id = campaign_id
             return True
 

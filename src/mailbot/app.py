@@ -46,9 +46,9 @@ class MailBot:
         self.signer = UnsubscribeSigner(self._box, base_url) if base_url else None
 
         self.accounts = AccountService(self.db, self.settings, self._box, transport_factory)
-        self.contacts = ContactService(self.db)
+        self.contacts = ContactService(self.db, clock)
         self.templates = TemplateService(self.db)
-        self.campaigns = CampaignService(self.db, self.settings, self.signer)
+        self.campaigns = CampaignService(self.db, self.settings, self.signer, clock)
         self.bounces = BounceScanner(self.db, self.contacts, self.accounts)
         self.dispatcher = Dispatcher(
             self.db,
