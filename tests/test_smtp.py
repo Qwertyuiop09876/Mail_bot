@@ -40,6 +40,16 @@ from mailbot.smtp import classify_smtp_error, translate_exception
             TransientDeliveryError,
         ),
         (554, "5.7.1 Rejected by policy", MessageRejected),
+        # review findings: our own DNS/sender misconfiguration must never bounce recipients
+        (550, "5.7.25 PTR record for the sending IP does not exist", MessageRejected),
+        (550, "5.7.1 Envelope-from domain does not exist", MessageRejected),
+        (550, "5.7.1 Recipient rejected: policy", MessageRejected),
+        (550, "5.7.1 Invalid address", MessageRejected),
+        (553, "Sender address rejected: not owned by user me@example.com", AccountError),
+        (551, "Sender not authorised", AccountError),
+        (550, "Sender domain does not exist", AccountError),
+        (450, "4.1.8 <a@example.com>: Sender address rejected: Domain not found", AccountError),
+        (550, "Your message looks like spam according to our content filters", MessageRejected),
         (550, "5.7.1 Rejected by policy", MessageRejected),
         (552, "5.2.2 mailbox full", MessageRejected),
         (554, "Transaction failed", MessageRejected),
@@ -64,6 +74,18 @@ def test_classification(code: int, text: str, expected: type[DeliveryError]) -> 
         (smtplib.SMTPAuthenticationError(535, b"5.7.8 bad"), AccountError),
         (smtplib.SMTPSenderRefused(550, b"5.7.1 sender not allowed", "a@b.ru"), AccountError),
         (
+            smtplib.SMTPSenderRefused(451, b"4.3.0 Temporary local problem", "a@b.ru"),
+            TransientDeliveryError,
+        ),
+        (smtplib.SMTPSenderRefused(421, b"Too many connections", "a@b.ru"), TransientDeliveryError),
+        (
+            smtplib.SMTPSenderRefused(
+                554, b"5.7.1 Message rejected under suspicion of SPAM", "a@b.ru"
+            ),
+            AccountError,
+        ),
+        (UnicodeEncodeError("ascii", "пароль", 0, 6, "ordinal not in range"), AccountError),
+        (
             smtplib.SMTPRecipientsRefused({"x@y.ru": (550, b"5.1.1 no such user")}),
             RecipientRejected,
         ),
@@ -80,7 +102,7 @@ def test_translate_exception(exc: Exception, expected: type[DeliveryError]) -> N
 
 def test_a_flagged_mailbox_keeps_its_recipient_and_explains_the_24h_rule() -> None:
     err = classify_smtp_error(554, "5.7.1 Message rejected under suspicion of SPAM")
-    assert isinstance(err, AccountError) and "24 hours" in str(err) and "extends" in str(err)
+    assert isinstance(err, AccountError) and "24 hours" in str(err) and "prolong" in str(err)
 
 
 def test_sender_wording_beats_the_unknown_user_text() -> None:
@@ -92,3 +114,13 @@ def test_sender_wording_beats_the_unknown_user_text() -> None:
 def test_unrelated_exceptions_are_not_swallowed() -> None:
     with pytest.raises(KeyError):
         translate_exception(KeyError("bug"))
+
+
+def test_a_malformed_host_is_a_setup_error_not_a_traceback() -> None:
+    from mailbot.models import Security
+    from mailbot.smtp import SmtpConfig, SmtpTransport
+
+    # "a..b" fails inside socket/idna before any DNS lookup, so this needs no network.
+    transport = SmtpTransport(SmtpConfig("a..b", 465, Security.SSL, "u", "p", timeout=2))
+    with pytest.raises(AccountError, match="invalid characters"):
+        transport.connect()

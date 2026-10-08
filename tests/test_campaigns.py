@@ -187,3 +187,77 @@ def test_validate_warns_when_the_recipient_address_is_not_in_the_body(env: Env) 
         html="<p>Письмо для {{ email }}. <a href='{{ unsubscribe_url }}'>Отписаться</a></p>",
     ).id  # fmt: skip
     assert not any("{{ email }}" in w for w in env.bot.campaigns.validate(with_email).warnings)
+
+
+@pytest.mark.parametrize(
+    ("host", "local"),
+    [
+        ("localhost", True),
+        ("LOCALHOST", True),
+        ("localhost.", True),
+        ("127.0.0.1", True),
+        ("127.0.0.5", True),
+        ("::1", True),
+        ("::ffff:127.0.0.1", True),
+        ("127.0.0.1.evil.com", False),  # a string-prefix test would accept this
+        ("127.evil.com", False),
+        ("localhost.evil.com", False),
+        ("smtp.example.com", False),
+        ("10.0.0.5", False),
+    ],
+)
+def test_plaintext_smtp_is_only_allowed_for_the_local_machine(host: str, local: bool) -> None:
+    from mailbot.accounts import _is_loopback
+
+    assert _is_loopback(host) is local
+
+
+def test_failed_verification_saves_nothing(env: Env) -> None:
+    from mailbot.errors import AccountError, LoginFailedError
+
+    env.transport.connect_error = AccountError("535 5.7.8 Invalid user or password!", code=535)
+    with pytest.raises(LoginFailedError, match="535"):
+        env.bot.accounts.add(
+            "ya", provider="yandex", from_email="me@yandex.ru", password="p", verify=True
+        )
+    assert env.bot.accounts.all() == []  # no half-configured account to clean up or trip over
+
+    env.transport.connect_error = None
+    env.bot.accounts.add(
+        "ya", provider="yandex", from_email="me@yandex.ru", password="p", verify=True
+    )
+    assert [a.name for a in env.bot.accounts.all()] == ["ya"]
+
+
+def test_a_duplicate_name_is_reported_before_any_login_attempt(env: Env) -> None:
+    env.seed(1)
+    env.transport.connects = 0
+    with pytest.raises(ValidationError, match="already exists"):
+        env.bot.accounts.add(
+            "main", provider="yandex", from_email="me@yandex.ru", password="p", verify=True
+        )
+    assert env.transport.connects == 0
+
+
+def test_non_ascii_passwords_are_refused_with_a_hint(env: Env) -> None:
+    env.seed(1)
+    for bad in ("пароль", "pässword"):
+        with pytest.raises(ValidationError, match="keyboard layout"):
+            env.bot.accounts.add("x", provider="yandex", from_email="me@yandex.ru", password=bad)
+        with pytest.raises(ValidationError, match="keyboard layout"):
+            env.bot.accounts.set_password("main", bad)
+    assert [a.name for a in env.bot.accounts.all()] == ["main"]
+
+
+def test_a_new_password_recovers_an_account_whose_key_was_lost(env: Env) -> None:
+    from mailbot.errors import ConfigError
+    from mailbot.models import Account
+
+    env.seed(1)
+    with env.bot.db.session() as s:  # simulate a stored password encrypted under another key
+        s.query(Account).one().password_enc = "gAAAAA-not-decryptable-with-the-current-key"
+    with pytest.raises(ConfigError, match="MAILBOT_SECRET_KEY"):
+        env.bot.accounts.check_connection("main")
+
+    env.bot.accounts.set_password("main", "fresh", verify=True)  # used to fail on the old decrypt
+    assert env.bot.accounts.check_connection("main").ok

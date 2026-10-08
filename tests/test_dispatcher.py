@@ -21,7 +21,7 @@ from mailbot.models import (
     DeliveryStatus,
 )
 
-from .conftest import Env
+from .conftest import Env, FakeTransport
 
 
 def deliveries(env: Env, campaign_id: int) -> list[Delivery]:
@@ -352,6 +352,72 @@ def test_send_test_prefixes_subject_and_skips_bookkeeping(env: Env) -> None:
     ((recipient, message),) = env.transport.sent
     assert recipient == "boss@example.com"
     assert message["Subject"].startswith("[TEST] ")
+    # same headers as a real send, so clients show their Unsubscribe button; the link is inert
+    assert message["List-Unsubscribe"] == "<https://example.com/unsubscribe/test>"
+    assert message["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
     assert deliveries(env, cid) == []
     with env.bot.db.session() as s:
         assert s.scalar(select(Contact).where(Contact.email == "boss@example.com")) is None
+
+
+def test_refused_connection_pauses_that_account_and_does_not_starve_the_next(env: Env) -> None:
+    """A permanent reply at connect time (our IP is blocklisted) used to escape tick() and keep
+    every account after it from ever being served."""
+    bot = env.bot
+    for name, host in (("a", "smtp.a.test"), ("b", "smtp.b.test")):
+        bot.accounts.add(
+            name, provider="custom", smtp_host=host, from_email=f"{name}@example.com", password="p"
+        )
+        bot.contacts.add(f"{name}-user@test.org", first_name="X", lists=[f"list-{name}"])
+    campaigns = {
+        name: bot.campaigns.create(
+            name, account=name, lists=[f"list-{name}"], subject="Hi",
+            html="<p>{{ unsubscribe_url }}</p>"
+        ).id
+        for name in ("a", "b")
+    }  # fmt: skip
+    broken = FakeTransport(
+        connect_error=MessageRejected(
+            "554 5.7.1 Client host blocked using zen.spamhaus.org", code=554
+        )
+    )
+    healthy = FakeTransport()
+    bot.dispatcher._transport_factory = lambda cfg: broken if cfg.host == "smtp.a.test" else healthy
+    for cid in campaigns.values():
+        bot.campaigns.send_now(cid)
+
+    bot.dispatcher.tick()  # must not raise
+
+    a, b = (bot.campaigns.get(campaigns[k]) for k in ("a", "b"))
+    assert a.status is CampaignStatus.PAUSED and "refused the connection" in (a.pause_reason or "")
+    assert b.status is CampaignStatus.COMPLETED and healthy.recipients == ["b-user@test.org"]
+    assert broken.attempts == []  # nobody was claimed or burned
+
+
+def test_account_block_also_holds_scheduled_campaigns_of_that_account(env: Env) -> None:
+    """Otherwise a scheduled campaign would activate later and hit the same block, prolonging it."""
+    cid = env.seed(3, daily_limit=10)
+    later = env.bot.campaigns.create(
+        "Later", account="main", lists=["clients"], subject="S", html="<p>{{ unsubscribe_url }}</p>"
+    ).id
+    env.bot.campaigns.schedule(later, env.clock.now + timedelta(hours=2))
+    env.transport.behavior = lambda _m, _r: AccountError(
+        "554 5.7.1 Message rejected under suspicion of SPAM", code=554
+    )
+    env.bot.campaigns.send_now(cid)
+    env.bot.dispatcher.tick()
+
+    assert campaign(env, cid).status is CampaignStatus.PAUSED
+    held = campaign(env, later)
+    assert held.status is CampaignStatus.PAUSED and "suspicion of SPAM" in (held.pause_reason or "")
+
+    env.clock.advance(hours=3)  # the scheduled time passes while the account is blocked...
+    attempts_before = len(env.transport.attempts)
+    env.bot.dispatcher.tick()
+    assert len(env.transport.attempts) == attempts_before  # ...and nothing touches the mailbox
+
+    env.transport.behavior = lambda _m, _r: None
+    resumed = env.bot.campaigns.resume(later)
+    assert (
+        resumed.status is CampaignStatus.SCHEDULED
+    )  # not started yet, so it goes back to scheduled

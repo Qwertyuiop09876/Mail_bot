@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -11,7 +12,13 @@ from .config import Settings
 from .crypto import SecretBox
 from .db import Database
 from .emails import normalize_email
-from .errors import NotFoundError, StateError, ValidationError
+from .errors import (
+    DeliveryError,
+    LoginFailedError,
+    NotFoundError,
+    StateError,
+    ValidationError,
+)
 from .models import Account, Campaign, Security
 from .providers import get_preset
 from .smtp import SmtpConfig, SmtpTransport, Transport
@@ -27,7 +34,27 @@ def _login_is_sender(account: Account) -> bool:
 
 
 def _is_loopback(host: str) -> bool:
-    return host in ("localhost", "::1") or host.startswith("127.")
+    """True only for the local machine. A string-prefix test would accept '127.0.0.1.evil.com'."""
+    name = host.strip().rstrip(".").lower()
+    if name == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+def _check_password(password: str) -> None:
+    if not password:
+        raise ValidationError("Password must not be empty")
+    if not password.isascii():
+        raise ValidationError(
+            "The password contains non-ASCII characters; SMTP login (Python's smtplib) only "
+            "supports ASCII. Check the keyboard layout: app passwords are plain Latin letters."
+        )
 
 
 @dataclass(frozen=True)
@@ -67,18 +94,21 @@ class AccountService:
         imap_port: int | None = None,
         daily_limit: int | None = None,
         rate_per_minute: int | None = None,
+        verify: bool = False,
     ) -> Account:
         """Register a mailbox. Unspecified connection details come from the provider preset.
 
         For ``provider="custom"`` pass ``smtp_host`` (and ``smtp_port``/``smtp_security`` if they
         differ from 465/ssl). ``password`` is encrypted before it touches the database.
+
+        With ``verify=True`` the SMTP login is tried *before* anything is saved and a failure raises
+        :class:`LoginFailedError`, so no half-configured account is ever left behind.
         """
         preset = get_preset(provider)
         name = name.strip()
         if not name:
             raise ValidationError("Account name must not be empty")
-        if not password:
-            raise ValidationError("Password must not be empty")
+        _check_password(password)
         from_email = normalize_email(from_email)
         host = smtp_host or preset.smtp_host
         if not host:
@@ -94,19 +124,35 @@ class AccountService:
         if limit < 1 or rate < 1:
             raise ValidationError("daily_limit and rate_per_minute must be positive")
 
+        reply_to_norm = normalize_email(reply_to) if reply_to else None
+        login = username or from_email
+        port = smtp_port or preset.smtp_port
         with self._db.session() as s:
-            if s.scalar(select(Account).where(Account.name == name)):
+            if s.scalar(select(Account.id).where(Account.name == name)) is not None:
                 raise ValidationError(f"Account {name!r} already exists")
+        if verify:
+            self._verify_login(
+                SmtpConfig(
+                    host=host,
+                    port=port,
+                    security=security,
+                    username=login,
+                    password=password,
+                    timeout=self._settings.smtp_timeout_seconds,
+                )
+            )
+
+        with self._db.session() as s:
             account = Account(
                 name=name,
                 provider=preset.key,
                 from_email=from_email,
                 from_name=from_name,
-                reply_to=normalize_email(reply_to) if reply_to else None,
+                reply_to=reply_to_norm,
                 smtp_host=host,
-                smtp_port=smtp_port or preset.smtp_port,
+                smtp_port=port,
                 smtp_security=security,
-                username=username or from_email,
+                username=login,
                 password_enc=self._box.encrypt(password),
                 imap_host=imap_host or preset.imap_host,
                 imap_port=imap_port or preset.imap_port,
@@ -133,12 +179,11 @@ class AccountService:
 
         With ``verify=True`` the new password must log in first; otherwise nothing is changed.
         """
-        if not password:
-            raise ValidationError("Password must not be empty")
+        _check_password(password)
         if verify:
             check = self.check_connection(name, password=password)
             if not check.ok:
-                raise ValidationError(f"Login with the new password failed: {check.detail}")
+                raise LoginFailedError(f"Login with the new password failed: {check.detail}")
         with self._db.session() as s:
             account = s.scalar(select(Account).where(Account.name == name))
             if account is None:
@@ -174,36 +219,44 @@ class AccountService:
                 raise StateError(f"Account {name!r} is used by {used} campaign(s)")
             s.delete(account)
 
-    def smtp_config(self, account: Account) -> SmtpConfig:
+    def smtp_config(self, account: Account, *, password: str | None = None) -> SmtpConfig:
+        """Connection settings. ``password`` replaces the stored one without decrypting it, so a
+        lost/changed MAILBOT_SECRET_KEY can still be recovered from by entering the password."""
         return SmtpConfig(
             host=account.smtp_host,
             port=account.smtp_port,
             security=account.smtp_security,
             username=account.username,
-            password=self._box.decrypt(account.password_enc),
+            password=password if password is not None else self._box.decrypt(account.password_enc),
             timeout=self._settings.smtp_timeout_seconds,
         )
+
+    def sender_warnings(self, account: Account) -> list[str]:
+        """Configuration smells that do not stop the login but will get messages rejected."""
+        if account.provider in ("yandex", "yandex360") and not _login_is_sender(account):
+            return [
+                "Yandex requires the From address to match the login exactly; "
+                "otherwise messages are rejected (553 'not owned by auth user')."
+            ]
+        return []
+
+    def _verify_login(self, config: SmtpConfig) -> None:
+        transport = self._transport_factory(config)
+        try:
+            transport.connect()
+        except DeliveryError as exc:
+            raise LoginFailedError(str(exc)) from exc
+        finally:
+            transport.close()
 
     def check_connection(self, name: str, *, password: str | None = None) -> ConnectionCheck:
         """Log in to the SMTP server without sending anything.
 
         ``password`` tries a candidate password instead of the stored one (nothing is saved).
         """
-        from dataclasses import replace
-
-        from .errors import DeliveryError
-
         account = self.get(name)
-        warnings: list[str] = []
-        if account.provider in ("yandex", "yandex360") and not _login_is_sender(account):
-            warnings.append(
-                "Yandex requires the From address to match the login exactly; "
-                "otherwise messages are rejected (553 'not owned by auth user')."
-            )
-        config = self.smtp_config(account)
-        if password is not None:
-            config = replace(config, password=password)
-        transport = self._transport_factory(config)
+        warnings = self.sender_warnings(account)
+        transport = self._transport_factory(self.smtp_config(account, password=password))
         try:
             transport.connect()
         except DeliveryError as exc:

@@ -23,6 +23,10 @@ class ValidationError(MailbotError):
     """User-supplied data is invalid."""
 
 
+class LoginFailedError(ValidationError):
+    """The mail server did not accept the credentials (or could not be reached)."""
+
+
 class StateError(MailbotError):
     """The requested operation is not allowed in the object's current state."""
 

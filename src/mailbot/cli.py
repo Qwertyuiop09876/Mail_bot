@@ -14,13 +14,14 @@ import threading
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import click
+from sqlalchemy.exc import SQLAlchemyError
 
 from . import __version__
 from .app import MailBot
 from .config import Settings
 from .crypto import generate_key
 from .dnscheck import check_domain
-from .errors import MailbotError, ValidationError
+from .errors import LoginFailedError, MailbotError
 from .models import CampaignStatus
 
 
@@ -116,8 +117,8 @@ def account_add(
 ) -> None:
     """Добавить ящик-отправитель. Пароль спросят скрытым вводом.
 
-    Ящик сохраняется, только если вход в SMTP удался (или указан --no-check).
-    Пароль хранится в базе в зашифрованном виде; сама база и .env в git не попадают.
+    Сначала выполняется вход в SMTP, и только если он удался, ящик сохраняется (при --no-check
+    проверки нет). Пароль хранится в базе в зашифрованном виде; база и .env в git не попадают.
     """
     if password_env:
         password = os.environ.get(password_env, "")
@@ -130,35 +131,34 @@ def account_add(
 
     with _bot() as bot:
         bot.init_db()
-        account = bot.accounts.add(
-            name,
-            provider=provider,
-            from_email=from_email,
-            password=password,
-            from_name=from_name,
-            reply_to=reply_to,
-            username=username,
-            smtp_host=smtp_host,
-            smtp_port=smtp_port,
-            smtp_security=smtp_security,
-            imap_host=imap_host,
-            imap_port=imap_port,
-            daily_limit=daily_limit,
-            rate_per_minute=rate_per_minute,
-        )
+        try:
+            # verify=True logs in BEFORE anything is stored: a failure leaves no account behind
+            account = bot.accounts.add(
+                name,
+                provider=provider,
+                from_email=from_email,
+                password=password,
+                from_name=from_name,
+                reply_to=reply_to,
+                username=username,
+                smtp_host=smtp_host,
+                smtp_port=smtp_port,
+                smtp_security=smtp_security,
+                imap_host=imap_host,
+                imap_port=imap_port,
+                daily_limit=daily_limit,
+                rate_per_minute=rate_per_minute,
+                verify=not no_check,
+            )
+        except LoginFailedError as exc:
+            click.secho(f"Вход не удался, ящик не сохранён: {exc}", fg="red", err=True)
+            if provider.startswith("yandex"):
+                click.echo(_YANDEX_LOGIN_HINT, err=True)
+            raise SystemExit(1) from exc
+        for warning in bot.accounts.sender_warnings(account):
+            click.secho(f"! {warning}", fg="yellow")
         if not no_check:
-            result = bot.accounts.check_connection(name)
-            for warning in result.warnings:
-                click.secho(f"! {warning}", fg="yellow")
-            if not result.ok:
-                bot.accounts.delete(name)  # nothing uses it yet; don't keep a broken account
-                click.secho(
-                    f"Вход не удался, ящик не сохранён: {result.detail}", fg="red", err=True
-                )
-                if provider.startswith("yandex"):
-                    click.echo(_YANDEX_LOGIN_HINT, err=True)
-                raise SystemExit(1)
-            click.secho(result.detail, fg="green")
+            click.secho(f"Вход в {account.smtp_host}:{account.smtp_port} выполнен", fg="green")
         click.echo(
             f"Ящик «{account.name}» ({account.from_email}) сохранён. "
             f"Лимиты: {account.daily_limit} писем/сутки, {account.rate_per_minute}/мин."
@@ -183,7 +183,7 @@ def account_password(name: str, password_env: str | None, no_check: bool) -> Non
     with _bot() as bot:
         try:
             bot.accounts.set_password(name, password, verify=not no_check)
-        except ValidationError:
+        except LoginFailedError:
             if bot.accounts.get(name).provider.startswith("yandex"):
                 click.echo(_YANDEX_LOGIN_HINT, err=True)
             raise
@@ -325,6 +325,15 @@ def main() -> None:
         cli(standalone_mode=False)
     except MailbotError as exc:
         click.secho(f"Ошибка: {exc}", fg="red", err=True)
+        raise SystemExit(1) from exc
+    except SQLAlchemyError as exc:
+        # Show the database's own wording only: the statement and its parameters can hold addresses.
+        reason = str(getattr(exc, "orig", None) or type(exc).__name__)
+        click.secho(
+            f"Ошибка базы данных: {reason}. Если база новая — выполните `mailbot init-db`.",
+            fg="red",
+            err=True,
+        )
         raise SystemExit(1) from exc
     except click.ClickException as exc:
         exc.show()

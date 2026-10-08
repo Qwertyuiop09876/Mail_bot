@@ -58,6 +58,7 @@ log = logging.getLogger(__name__)
 
 MAX_PER_TICK = 50  # keep ticks short so pause/cancel and shutdown take effect promptly
 _INSERT_CHUNK = 1000
+_TEST_UNSUBSCRIBE_URL = "https://example.com/unsubscribe/test"  # placeholder, never a real token
 _DAY = timedelta(hours=24)
 
 
@@ -131,7 +132,13 @@ class Dispatcher:
             blocked_until = self._backoff_until.get(account_id)
             if blocked_until is not None and blocked_until > now:
                 continue
-            self._send_for_account(account_id, report)
+            try:
+                self._send_for_account(account_id, report)
+            except Exception:
+                # One account's unexpected failure must not starve the accounts after it.
+                log.exception(
+                    "sending for account %d failed; continuing with the others", account_id
+                )
             if self._stop.is_set():
                 break
         self._complete_finished(report)
@@ -207,7 +214,7 @@ class Dispatcher:
                 first_name=contact.first_name if contact else "Тест",
                 last_name=contact.last_name if contact else None,
                 attributes=dict(contact.attributes) if contact else {},
-                unsubscribe_url="https://example.com/unsubscribe/test",
+                unsubscribe_url=_TEST_UNSUBSCRIBE_URL,
             )
             rendered = render(
                 subject=campaign.subject, html=campaign.html, text=campaign.text, context=context
@@ -220,7 +227,7 @@ class Dispatcher:
             subject=f"[TEST] {rendered.subject}",
             html=rendered.html,
             text=rendered.text,
-            unsubscribe_url=None,
+            unsubscribe_url=_TEST_UNSUBSCRIBE_URL,  # same headers as a real send; the link is inert
             date=self._clock(),
         )
         transport = self._transport_factory(self._accounts.smtp_config(account))
@@ -345,6 +352,10 @@ class Dispatcher:
             self._pause_account(account_id, f"account error: {exc}", report)
         except TransientDeliveryError as exc:
             self._back_off(account_id, str(exc))
+        except DeliveryError as exc:
+            # A permanent, non-account reply to connect/EHLO/STARTTLS (e.g. our IP is blocklisted):
+            # no recipient is involved, nothing will improve by retrying every few seconds.
+            self._pause_account(account_id, f"server refused the connection: {exc}", report)
         finally:
             transport.close()
 
@@ -565,7 +576,10 @@ class Dispatcher:
     def _pause_campaign(self, campaign_id: int, reason: str, report: TickReport) -> None:
         with self._db.session() as s:
             campaign = s.get(Campaign, campaign_id)
-            if campaign is not None and campaign.status is CampaignStatus.SENDING:
+            if campaign is not None and campaign.status in (
+                CampaignStatus.SENDING,
+                CampaignStatus.SCHEDULED,
+            ):
                 campaign.status = CampaignStatus.PAUSED
                 campaign.pause_reason = reason
                 report.paused.append((campaign_id, reason))
@@ -575,8 +589,11 @@ class Dispatcher:
         with self._db.session() as s:
             ids = list(
                 s.scalars(
+                    # Scheduled campaigns too: otherwise one would activate later and hit the
+                    # same block again, which for a spam block extends it.
                     select(Campaign.id).where(
-                        Campaign.account_id == account_id, Campaign.status == CampaignStatus.SENDING
+                        Campaign.account_id == account_id,
+                        Campaign.status.in_([CampaignStatus.SENDING, CampaignStatus.SCHEDULED]),
                     )
                 )
             )

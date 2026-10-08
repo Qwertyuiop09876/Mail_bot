@@ -382,3 +382,17 @@ def test_failed_yandex_login_prints_the_checklist(cli_env) -> None:  # type: ign
     assert "ящик не сохранён" in result.output
     for needle in ("пароль приложения", "Пароли приложений и OAuth-токены", "EULA", "29.06.2026"):
         assert needle in result.output
+
+
+def test_account_add_with_a_cyrillic_password_saves_nothing(server, cli_env) -> None:  # type: ignore[no-untyped-def]
+    from click.testing import CliRunner
+
+    from mailbot.cli import cli
+    from mailbot.errors import ValidationError
+
+    _, port = server
+    runner = CliRunner()
+    result = runner.invoke(cli, add_args(port), input="пароль\n")  # typed on the Russian layout
+    assert result.exit_code == 1 and isinstance(result.exception, ValidationError)
+    assert "keyboard layout" in str(result.exception)
+    assert "Ящиков нет" in runner.invoke(cli, ["accounts"]).output

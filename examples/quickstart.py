@@ -2,7 +2,8 @@
 
 Запуск (после `make install`, `mailbot gen-key` → .env, см. README):
 
-    YANDEX_APP_PASSWORD=... python examples/quickstart.py contacts.csv me@example.com
+    read -rs YANDEX_APP_PASSWORD && export YANDEX_APP_PASSWORD   # ввод скрыт, в историю не попадёт
+    python examples/quickstart.py contacts.csv me@example.com
 
 Скрипт только готовит и планирует кампанию. Отправляет её воркер: `mailbot run`.
 Пароль берётся из переменной окружения — не вписывайте его в код.
