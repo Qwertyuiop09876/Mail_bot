@@ -20,7 +20,7 @@ from .app import MailBot
 from .config import Settings
 from .crypto import generate_key
 from .dnscheck import check_domain
-from .errors import MailbotError
+from .errors import MailbotError, ValidationError
 from .models import CampaignStatus
 
 
@@ -53,11 +53,21 @@ def init_db() -> None:
         click.echo(f"База готова: {bot.settings.database_url}")
 
 
-_YANDEX_LOGIN_HINT = (
-    "Частые причины для Яндекса: используется пароль аккаунта вместо пароля приложения; "
-    "в Почта → Настройки → Почтовые программы не включён доступ по IMAP; "
-    "логин указан без домена (нужен полный адрес)."
-)
+_YANDEX_LOGIN_HINT = """\
+Что проверить для Яндекса:
+ 1. Нужен пароль приложения (тип «Почта»), а не пароль аккаунта. Новый пароль иногда начинает
+    работать не сразу — подождите до 2–3 часов.
+ 2. Почта → Все настройки → Почтовые программы: включите «С сервера imap.yandex.ru по протоколу
+    IMAP» и «Пароли приложений и OAuth-токены».
+ 3. Новый ящик один раз откройте в браузере и примите пользовательское соглашение
+    (ошибка «Please accept EULA first»).
+ 4. Логин: для ящика на своём домене — полный адрес; для личного @yandex.ru попробуйте и полный
+    адрес, и имя до @ (--login имя).
+ 5. Ящик на своём домене: по сообщениям СМИ и Saby, с 29.06.2026 доступ по IMAP/SMTP требует
+    платного тарифа Яндекс 360. Официально это проверить не удалось — если пункты 1–4 в порядке,
+    начните с этого.
+ 6. Защита Яндекса могла временно заблокировать аккаунт (чаще — нет привязанного телефона);
+    блокировка обычно снимается через пару часов."""
 
 
 @cli.command("account-add")
@@ -153,6 +163,31 @@ def account_add(
             f"Ящик «{account.name}» ({account.from_email}) сохранён. "
             f"Лимиты: {account.daily_limit} писем/сутки, {account.rate_per_minute}/мин."
         )
+
+
+@cli.command("account-password")
+@click.argument("name")
+@click.option("--password-env", metavar="VAR", help="Взять новый пароль из переменной окружения.")
+@click.option("--no-check", is_flag=True, help="Сохранить без проверки входа.")
+def account_password(name: str, password_env: str | None, no_check: bool) -> None:
+    """Заменить пароль ящика (например, после отзыва пароля приложения).
+
+    Новый пароль сначала проверяется входом в SMTP; при неудаче старый остаётся как был.
+    """
+    if password_env:
+        password = os.environ.get(password_env, "")
+        if not password:
+            raise click.UsageError(f"Переменная окружения {password_env} не задана или пуста")
+    else:
+        password = click.prompt("Новый пароль, ввод скрыт", hide_input=True)
+    with _bot() as bot:
+        try:
+            bot.accounts.set_password(name, password, verify=not no_check)
+        except ValidationError:
+            if bot.accounts.get(name).provider.startswith("yandex"):
+                click.echo(_YANDEX_LOGIN_HINT, err=True)
+            raise
+        click.secho(f"Пароль ящика «{name}» обновлён", fg="green")
 
 
 @cli.command()

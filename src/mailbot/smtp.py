@@ -55,6 +55,18 @@ _UNKNOWN_USER = re.compile(
     r"|нет такого|не существует",
     re.IGNORECASE,
 )
+# Replies meaning "this *mailbox* is flagged for spam", not "this recipient is bad". Yandex blocks
+# such a sender for 24 hours and extends the block with every further send attempt, so the only
+# right reaction is to stop sending from the account at once (AccountError) and keep the recipient.
+_SENDER_FLAGGED = re.compile(
+    r"suspicion of spam|blocked by spam statistics|spamsource\.mail\.yandex\.net"
+    r"|looks like spam|spam limit exceeded",
+    re.IGNORECASE,
+)
+_FLAGGED_HINT = (
+    " [sending from this mailbox looks blocked as spam; Yandex lifts such blocks after 24 hours "
+    "WITHOUT send attempts, every attempt extends it: wait a day, then resume]"
+)
 
 
 def classify_smtp_error(code: int | None, text: str) -> DeliveryError:
@@ -62,26 +74,28 @@ def classify_smtp_error(code: int | None, text: str) -> DeliveryError:
     msg = f"{code} {text}".strip() if code else text
     enhanced = _ENHANCED.search(text)
     enh = ".".join(enhanced.groups()) if enhanced else None
+    sender_problem = "sender" in text.lower()
 
     if code in (530, 534, 535, 538) or enh in {"5.7.0", "5.7.8", "5.7.9", "4.7.8"}:
         return AccountError(msg, code=code)
     if enh in _SENDER_CODES:
         return AccountError(msg, code=code)
+    if _SENDER_FLAGGED.search(text):  # before the 4xx rule: some variants are temporary-looking
+        return AccountError(msg + _FLAGGED_HINT, code=code)
 
     if code is None or 400 <= code < 500:
         return TransientDeliveryError(msg, code=code)
 
     if enh in _RECIPIENT_CODES:
         return RecipientRejected(msg, code=code)
-    if enh and enh.startswith("5.7."):
-        if "sender" in text.lower():
-            return AccountError(msg, code=code)
-        return MessageRejected(msg, code=code)
-    if enh is None:
-        if code in (551, 553):
-            return RecipientRejected(msg, code=code)
-        if code == 550 and _UNKNOWN_USER.search(text):
-            return RecipientRejected(msg, code=code)
+    if enh and enh.startswith("5.7.") and sender_problem:
+        return AccountError(msg, code=code)
+    # Yandex answers "550 5.7.1 No such user!": an unknown recipient wearing a policy code, so
+    # the text has to win over the 5.7.x family (otherwise dead addresses are never suppressed).
+    if code in (550, 551, 553) and _UNKNOWN_USER.search(text) and not sender_problem:
+        return RecipientRejected(msg, code=code)
+    if enh is None and code in (551, 553):
+        return RecipientRejected(msg, code=code)
     return MessageRejected(msg, code=code)
 
 

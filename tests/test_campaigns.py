@@ -126,6 +126,10 @@ def test_provider_presets(env: Env) -> None:
         "imap.yandex.ru",
         3000,
     )
+    personal = env.bot.accounts.add(
+        "me", provider="yandex", from_email="me@yandex.ru", password="p"
+    )
+    assert (personal.daily_limit, personal.rate_per_minute) == (300, 10)  # conservative default
     with pytest.raises(ValidationError, match="smtp_host"):
         env.bot.accounts.add("x", provider="custom", from_email="a@b.ru", password="p")
     with pytest.raises(ValidationError, match="clear text"):
@@ -135,3 +139,51 @@ def test_provider_presets(env: Env) -> None:
         )  # fmt: skip
     with pytest.raises(ValidationError, match="Unknown provider"):
         env.bot.accounts.add("y", provider="gmail", from_email="a@b.ru", password="p")
+
+
+def test_yandex_login_must_equal_the_sender_but_a_bare_login_is_fine(env: Env) -> None:
+    accounts = env.bot.accounts
+    # login defaults to the full address
+    accounts.add("full", provider="yandex", password="p", from_email="ivan@yandex.ru")
+    accounts.add(
+        "bare", provider="yandex", password="p", from_email="ivan@yandex.ru", username="ivan"
+    )
+    accounts.add(
+        "other",
+        provider="yandex",
+        password="p",
+        from_email="shop@yandex.ru",
+        username="ivan@yandex.ru",
+    )
+    assert accounts.check_connection("full").warnings == []
+    assert accounts.check_connection("bare").warnings == []  # "ivan" means ivan@yandex.ru
+    assert "match the login exactly" in accounts.check_connection("other").warnings[0]
+
+
+def test_password_change_is_verified_before_it_is_saved(env: Env) -> None:
+    from mailbot.errors import AccountError
+
+    env.seed(1)
+    accounts = env.bot.accounts
+    env.transport.connect_error = AccountError("535 5.7.8 Invalid user or password!", code=535)
+    with pytest.raises(ValidationError, match=r"new password failed.*535"):
+        accounts.set_password("main", "typo", verify=True)
+    assert accounts.smtp_config(accounts.get("main")).password == "secret"  # unchanged
+
+    env.transport.connect_error = None
+    accounts.set_password("main", "fresh", verify=True)
+    assert accounts.smtp_config(accounts.get("main")).password == "fresh"
+
+    # check_connection can try a candidate without saving it
+    assert accounts.check_connection("main", password="candidate").ok
+    assert accounts.smtp_config(accounts.get("main")).password == "fresh"
+
+
+def test_validate_warns_when_the_recipient_address_is_not_in_the_body(env: Env) -> None:
+    no_email = env.seed(1)
+    assert any("{{ email }}" in w for w in env.bot.campaigns.validate(no_email).warnings)
+    with_email = env.bot.campaigns.create(
+        "C2", account="main", lists=["clients"], subject="s",
+        html="<p>Письмо для {{ email }}. <a href='{{ unsubscribe_url }}'>Отписаться</a></p>",
+    ).id  # fmt: skip
+    assert not any("{{ email }}" in w for w in env.bot.campaigns.validate(with_email).warnings)

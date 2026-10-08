@@ -32,6 +32,7 @@ class Inbox:
     def __init__(self) -> None:
         self.messages: list[Any] = []
         self.reject: dict[str, str] = {}
+        self.data_reply: str | None = None  # e.g. a spam verdict returned after DATA
 
     async def handle_RCPT(self, _server, _session, envelope, address, _opts):  # type: ignore[no-untyped-def]
         if address in self.reject:
@@ -40,6 +41,8 @@ class Inbox:
         return "250 OK"
 
     async def handle_DATA(self, _server, _session, envelope):  # type: ignore[no-untyped-def]
+        if self.data_reply is not None:
+            return self.data_reply
         self.messages.append(envelope)
         return "250 Message accepted"
 
@@ -147,7 +150,7 @@ def test_full_campaign_through_a_real_smtp_server(server, tmp_path) -> None:  # 
 
 def test_server_rejecting_message_content_is_classified(server) -> None:  # type: ignore[no-untyped-def]
     inbox, port = server
-    inbox.reject["spammy@test.org"] = "554 5.7.1 Message rejected under suspicion of SPAM"
+    inbox.reject["spammy@test.org"] = "554 5.7.1 Rejected by policy"
     inbox.reject["nobody@test.org"] = "550 5.1.1 User unknown"
     from mailbot.message import build_message
 
@@ -300,3 +303,82 @@ def test_account_add_no_check_works_offline_and_yandex_gets_its_preset(cli_env) 
     )
     assert result.exit_code == 0 and "3000 писем/сутки" in result.output
     assert "smtp.yandex.ru:465/ssl" in runner.invoke(cli, ["accounts"]).output
+
+
+def test_spam_block_stops_after_one_attempt_and_loses_nobody(server, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Yandex extends a spam block with every further attempt: stop at the first reply."""
+    inbox, port = server
+    inbox.data_reply = "554 5.7.1 [1] Message rejected under suspicion of SPAM; https://ya.cc/x"
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        database_url=f"sqlite:///{tmp_path}/spam.db",
+        secret_key=generate_key(),  # type: ignore[arg-type]
+        unsubscribe_base_url=BASE_URL,
+    )
+    attempts: list[str] = []
+    real_factory = SmtpTransport
+
+    class Counting(real_factory):  # type: ignore[valid-type, misc]
+        def send(self, message, *, sender, recipient):  # type: ignore[no-untyped-def]
+            attempts.append(recipient)
+            super().send(message, sender=sender, recipient=recipient)
+
+    with MailBot(settings, transport_factory=Counting, sleep=lambda _s: None) as bot:
+        bot.init_db()
+        bot.accounts.add(
+            "main", provider="custom", smtp_host="127.0.0.1", smtp_port=port, smtp_security="none",
+            from_email="news@example.com", password="app-pass", rate_per_minute=6000,
+        )  # fmt: skip
+        for name in ("a", "b", "c", "d"):
+            bot.contacts.add(f"{name}@test.org", first_name=name, lists=["l"])
+        cid = bot.campaigns.create(
+            "C", account="main", lists=["l"], subject="Hi {{ first_name }}",
+            html="<p>{{ unsubscribe_url }}</p>",
+        ).id  # fmt: skip
+        bot.campaigns.send_now(cid)
+        for _ in range(3):
+            bot.dispatcher.tick()
+
+        campaign = bot.campaigns.get(cid)
+        stats = bot.campaigns.stats(cid)
+        assert campaign.status is CampaignStatus.PAUSED
+        assert "24 hours" in (campaign.pause_reason or "")
+        assert len(attempts) == 1  # no hammering: more attempts would extend the ban
+        assert (stats.pending, stats.failed, stats.sent) == (4, 0, 0)  # nobody lost
+
+
+def test_account_password_command_verifies_before_saving(server, cli_env) -> None:  # type: ignore[no-untyped-def]
+    from click.testing import CliRunner
+
+    from mailbot.cli import cli
+
+    _, port = server
+    runner = CliRunner()
+    assert runner.invoke(cli, add_args(port), input="app-pass\n").exit_code == 0
+
+    bad = runner.invoke(cli, ["account-password", "main"], input="typo\n")
+    # CliRunner hands us the exception; in real use main() prints it as "Ошибка: ..."
+    assert bad.exit_code == 1 and "new password failed" in str(bad.exception)
+    assert "typo" not in bad.output and "typo" not in str(bad.exception)
+
+    # the stored password still works: a no-op re-add of the same password verifies and saves
+    good = runner.invoke(cli, ["account-password", "main"], input="app-pass\n")
+    assert good.exit_code == 0 and "обновлён" in good.output
+
+
+def test_failed_yandex_login_prints_the_checklist(cli_env) -> None:  # type: ignore[no-untyped-def]
+    """Unreachable server stands in for any failed login; the Yandex hint must come with it."""
+    from click.testing import CliRunner
+
+    from mailbot.cli import cli
+
+    result = CliRunner().invoke(
+        cli,
+        ["account-add", "ya", "--provider", "yandex", "--email", "me@yandex.ru",
+         "--smtp-host", "127.0.0.1", "--smtp-port", "1"],
+        input="pw\n",
+    )  # fmt: skip
+    assert result.exit_code == 1
+    assert "ящик не сохранён" in result.output
+    for needle in ("пароль приложения", "Пароли приложений и OAuth-токены", "EULA", "29.06.2026"):
+        assert needle in result.output

@@ -124,10 +124,23 @@ class BounceScanner:
         cfg = self._accounts.smtp_config(account)  # same login/password for IMAP
         report = BounceReport()
 
-        imap = imap_factory(account.imap_host, account.imap_port or 993, timeout=cfg.timeout)
         try:
-            imap.login(cfg.username, cfg.password)
-            imap.select(mailbox)
+            imap = imap_factory(account.imap_host, account.imap_port or 993, timeout=cfg.timeout)
+        except OSError as exc:
+            raise ConfigError(
+                f"Cannot connect to IMAP {account.imap_host}:{account.imap_port or 993}: {exc}"
+            ) from exc
+        try:
+            try:
+                imap.login(cfg.username, cfg.password)
+            except imaplib.IMAP4.error as exc:
+                raise ConfigError(
+                    f"IMAP login failed ({exc}). Check the app password and that IMAP access is "
+                    "enabled in the mailbox settings (Yandex: Mail → Settings → Mail clients)."
+                ) from exc
+            status, _ = imap.select(mailbox)
+            if status != "OK":
+                raise ConfigError(f"Cannot open IMAP folder {mailbox!r} (status {status})")
             _, data = imap.search(None, "UNSEEN")
             numbers = (data[0] or b"").split()[-limit:]
             for number in numbers:

@@ -24,7 +24,22 @@ from mailbot.smtp import classify_smtp_error, translate_exception
         (550, "No such user here", RecipientRejected),
         (550, "Пользователь не существует", RecipientRejected),
         (551, "User not local", RecipientRejected),
-        (554, "5.7.1 Message rejected under suspicion of SPAM", MessageRejected),
+        # Yandex-specific replies (see the research notes in CLAUDE.md / README)
+        (550, "5.7.1 No such user!", RecipientRejected),  # unknown recipient with a policy code
+        (550, "5.7.1 Policy rejection on the target address", MessageRejected),
+        (552, "5.2.2 Mailbox size limit exceeded", MessageRejected),
+        (554, "5.7.1 [1] Message rejected under suspicion of SPAM; https://ya.cc/x", AccountError),
+        (554, "5.7.1 Blocked by spam statistics", AccountError),
+        (554, "Client host [1.2.3.4] blocked using spamsource.mail.yandex.net", AccountError),
+        (451, "4.7.1 Spam limit exceeded", AccountError),
+        (535, "5.7.8 Error: authentication failed: Invalid user or password!", AccountError),
+        (535, "5.7.8 Error: authentication failed: Please accept EULA first.", AccountError),
+        (
+            451,
+            "4.7.1 Sorry, the service is currently unavailable. Please come back later.",
+            TransientDeliveryError,
+        ),
+        (554, "5.7.1 Rejected by policy", MessageRejected),
         (550, "5.7.1 Rejected by policy", MessageRejected),
         (552, "5.2.2 mailbox full", MessageRejected),
         (554, "Transaction failed", MessageRejected),
@@ -61,6 +76,17 @@ def test_classification(code: int, text: str, expected: type[DeliveryError]) -> 
 )
 def test_translate_exception(exc: Exception, expected: type[DeliveryError]) -> None:
     assert type(translate_exception(exc)) is expected
+
+
+def test_a_flagged_mailbox_keeps_its_recipient_and_explains_the_24h_rule() -> None:
+    err = classify_smtp_error(554, "5.7.1 Message rejected under suspicion of SPAM")
+    assert isinstance(err, AccountError) and "24 hours" in str(err) and "extends" in str(err)
+
+
+def test_sender_wording_beats_the_unknown_user_text() -> None:
+    # "does not exist" about the *sender* domain is our configuration problem, not a dead recipient
+    err = classify_smtp_error(550, "5.7.1 Sender domain does not exist")
+    assert isinstance(err, AccountError)
 
 
 def test_unrelated_exceptions_are_not_swallowed() -> None:

@@ -17,6 +17,15 @@ from .providers import get_preset
 from .smtp import SmtpConfig, SmtpTransport, Transport
 
 
+def _login_is_sender(account: Account) -> bool:
+    """Yandex wants From == login. A personal mailbox may log in with the bare name ("ivan"),
+    which stands for ivan@yandex.ru."""
+    login = account.username.lower()
+    if "@" not in login:
+        login = f"{login}@yandex.ru"
+    return login == account.from_email.lower()
+
+
 def _is_loopback(host: str) -> bool:
     return host in ("localhost", "::1") or host.startswith("127.")
 
@@ -119,9 +128,17 @@ class AccountService:
         with self._db.session() as s:
             return list(s.scalars(select(Account).order_by(Account.name)))
 
-    def set_password(self, name: str, password: str) -> None:
+    def set_password(self, name: str, password: str, *, verify: bool = False) -> None:
+        """Replace the stored password (e.g. after an app password was revoked).
+
+        With ``verify=True`` the new password must log in first; otherwise nothing is changed.
+        """
         if not password:
             raise ValidationError("Password must not be empty")
+        if verify:
+            check = self.check_connection(name, password=password)
+            if not check.ok:
+                raise ValidationError(f"Login with the new password failed: {check.detail}")
         with self._db.session() as s:
             account = s.scalar(select(Account).where(Account.name == name))
             if account is None:
@@ -167,21 +184,26 @@ class AccountService:
             timeout=self._settings.smtp_timeout_seconds,
         )
 
-    def check_connection(self, name: str) -> ConnectionCheck:
-        """Log in to the SMTP server without sending anything."""
+    def check_connection(self, name: str, *, password: str | None = None) -> ConnectionCheck:
+        """Log in to the SMTP server without sending anything.
+
+        ``password`` tries a candidate password instead of the stored one (nothing is saved).
+        """
+        from dataclasses import replace
+
         from .errors import DeliveryError
 
         account = self.get(name)
         warnings: list[str] = []
-        if account.username.lower() != account.from_email and account.provider in (
-            "yandex",
-            "yandex360",
-        ):
+        if account.provider in ("yandex", "yandex360") and not _login_is_sender(account):
             warnings.append(
-                "Yandex normally requires the From address to match the login; "
-                "otherwise the message may be rejected or rewritten."
+                "Yandex requires the From address to match the login exactly; "
+                "otherwise messages are rejected (553 'not owned by auth user')."
             )
-        transport = self._transport_factory(self.smtp_config(account))
+        config = self.smtp_config(account)
+        if password is not None:
+            config = replace(config, password=password)
+        transport = self._transport_factory(config)
         try:
             transport.connect()
         except DeliveryError as exc:

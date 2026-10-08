@@ -265,6 +265,13 @@ class CampaignService:
                     "The body has no {{ unsubscribe_url }} link. The List-Unsubscribe header is "
                     "still added, but a visible link in the footer is strongly recommended."
                 )
+            body = campaign.html + (campaign.text or "")
+            if "{{ email" not in body.replace("{{email", "{{ email"):
+                report.warnings.append(
+                    "The body does not show the recipient's address ({{ email }}). Yandex lists "
+                    "this among its requirements for bulk mail and it helps people see why they "
+                    "got the message."
+                )
             if not campaign.text:
                 report.warnings.append(
                     "No plain-text part: it will be generated from the HTML automatically."

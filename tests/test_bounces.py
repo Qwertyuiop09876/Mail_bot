@@ -59,7 +59,8 @@ class FakeImap:
         return self
 
     def login(self, *_a: Any) -> None: ...
-    def select(self, *_a: Any) -> None: ...
+    def select(self, *_a: Any) -> tuple[str, list[bytes]]:
+        return "OK", [b"1"]
 
     def search(self, *_a: Any) -> tuple[str, list[bytes]]:
         return "OK", [b" ".join(str(i + 1).encode() for i in range(len(self.messages)))]
@@ -138,6 +139,41 @@ def test_forged_or_foreign_bounces_do_not_suppress_anyone(sent_env) -> None:  # 
     assert (report.hard, report.unmatched, report.suppressed) == (0, 3, [])
     assert env.bot.contacts.get(recipient).status is ContactStatus.ACTIVE
     assert env.bot.contacts.get(other).status is ContactStatus.ACTIVE
+
+
+def test_imap_login_failure_is_a_clear_error_not_a_traceback(sent_env) -> None:  # type: ignore[no-untyped-def]
+    import imaplib
+
+    env, _, _ = sent_env
+    with env.bot.db.session() as s:
+        from mailbot.models import Account
+
+        s.query(Account).one().imap_host = "imap.test"
+
+    class RefusingImap(FakeImap):
+        def login(self, *_a: Any) -> None:
+            raise imaplib.IMAP4.error(
+                "[AUTHENTICATIONFAILED] Invalid credentials or IMAP is disabled"
+            )
+
+    imap = RefusingImap([])
+    with pytest.raises(ConfigError, match=r"IMAP is disabled.*enabled in the mailbox settings"):
+        env.bot.bounces.scan("main", imap_factory=imap)
+    assert imap.logged_out  # the connection is released even when login fails
+
+
+def test_yandex_style_no_such_user_bounce_is_a_hard_bounce(sent_env) -> None:  # type: ignore[no-untyped-def]
+    env, recipient, message_id = sent_env
+    with env.bot.db.session() as s:
+        from mailbot.models import Account
+
+        s.query(Account).one().imap_host = "imap.test"
+    dsn = make_dsn(
+        recipient, message_id, status="5.7.1", diagnostic="smtp; 550 5.7.1 No such user!"
+    )
+    report = env.bot.bounces.scan("main", imap_factory=FakeImap([dsn]))
+    assert (report.hard, report.suppressed) == (1, [recipient])
+    assert env.bot.contacts.get(recipient).status is ContactStatus.BOUNCED
 
 
 def test_scan_needs_imap_configured(env: Env) -> None:
